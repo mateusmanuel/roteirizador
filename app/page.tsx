@@ -21,9 +21,9 @@ type RawRow = {
   Longitude?: number | string;
   "Destination Address"?: string;
   "SPX TN"?: string;
+  "Zipcode/Postal code"?: string;
 };
 
-// Agora cada linha é um endereço individual (não agrupado)
 type AddressPoint = {
   stop: number;
   sequence: number;
@@ -31,10 +31,11 @@ type AddressPoint = {
   lng: number;
   address: string;
   spx?: string;
-  distanceFromPrev?: number; // metros
+  cep?: string;
+  distanceFromPrev?: number;
 };
 
-// ================= PARSE INDIVIDUAL =================
+// ================= PARSE =================
 
 function parseRows(rows: RawRow[]): AddressPoint[] {
   return rows
@@ -46,6 +47,7 @@ function parseRows(rows: RawRow[]): AddressPoint[] {
       lng: Number(r.Longitude),
       address: String(r["Destination Address"] ?? ""),
       spx: r["SPX TN"] ? String(r["SPX TN"]) : undefined,
+      cep: r["Zipcode/Postal code"] ? String(r["Zipcode/Postal code"]) : undefined,
     }));
 }
 
@@ -68,8 +70,7 @@ async function fetchOptimizedTrip(points: AddressPoint[], startIndex: number) {
   const geometry: LatLngExpression[] =
     trip?.geometry?.coordinates?.map((c: [number, number]) => [c[1], c[0]]) ?? [];
 
-  // ordenar pela posição ao longo da geometria
-  const ordered = [...reordered].sort((a, b) => {
+  const orderedByGeometry = [...reordered].sort((a, b) => {
     const idxA = geometry.findIndex(
       (g) => Math.abs((g as number[])[0] - a.lat) < 0.001 && Math.abs((g as number[])[1] - a.lng) < 0.001
     );
@@ -81,15 +82,37 @@ async function fetchOptimizedTrip(points: AddressPoint[], startIndex: number) {
     return idxA - idxB;
   });
 
-  // calcular distâncias entre pontos consecutivos
   const legs = trip?.legs ?? [];
 
-  ordered.forEach((p, i) => {
+  orderedByGeometry.forEach((p, i) => {
     if (i === 0) return;
     p.distanceFromPrev = legs[i - 1]?.distance ?? 0;
   });
 
-  return { ordered, geometry };
+  // 🔎 Agrupar CEPs iguais mantendo a ordem geométrica do primeiro
+  const groupedByCep: AddressPoint[] = [];
+  const visited = new Set<number>();
+
+  orderedByGeometry.forEach((point, idx) => {
+    if (visited.has(idx)) return;
+
+    if (!point.cep) {
+      groupedByCep.push(point);
+      visited.add(idx);
+      return;
+    }
+
+    const sameCepIndexes = orderedByGeometry
+      .map((p, i) => ({ p, i }))
+      .filter(({ p }) => p.cep === point.cep)
+      .map(({ i }) => i);
+
+    sameCepIndexes.forEach((i) => visited.add(i));
+
+    sameCepIndexes.forEach((i) => groupedByCep.push(orderedByGeometry[i]));
+  });
+
+  return { ordered: groupedByCep, geometry };
 }
 
 // ================= COMPONENT =================
@@ -102,7 +125,6 @@ export default function LogisticsStopsApp(): ReactElement {
   const [iconFactory, setIconFactory] = useState<any>(null);
   const [delivered, setDelivered] = useState<Set<number>>(new Set());
 
-  // persistência na sessão
   useEffect(() => {
     const saved = sessionStorage.getItem("deliveredPoints");
     if (saved) setDelivered(new Set(JSON.parse(saved)));
@@ -112,7 +134,6 @@ export default function LogisticsStopsApp(): ReactElement {
     sessionStorage.setItem("deliveredPoints", JSON.stringify(Array.from(delivered)));
   }, [delivered]);
 
-  // ícones numerados
   useEffect(() => {
     import("leaflet").then((L) => {
       setIconFactory(() => (index: number) =>
@@ -160,26 +181,52 @@ export default function LogisticsStopsApp(): ReactElement {
 
   return (
     <div className="h-screen grid grid-cols-1 lg:grid-cols-[1fr_1fr]">
-      {/* MAPA */}
       <div className="h-[260px] lg:h-screen">
         {polyline.length > 0 && iconFactory && (
-          <Map center={polyline[0]} zoom={15} maxZoom={20} className="h-full">
-            <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+          <Map center={polyline[0]} zoom={15} maxZoom={19} scrollWheelZoom className="h-full">
+            <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" maxZoom={19} />
 
-            {route.map((p, i) => (
-              <Marker key={i} position={[p.lat, p.lng]} icon={iconFactory(i + 1)}>
-                <Popup>
-                  #{i + 1} • Seq {p.sequence} • Stop {p.stop}
-                </Popup>
-              </Marker>
-            ))}
+            {route.map((p, i) => {
+              const sameLocation = route.filter(
+                (r) => Math.abs(r.lat - p.lat) < 0.00001 && Math.abs(r.lng - p.lng) < 0.00001
+              );
+
+              const sameSequences = sameLocation.map((r) => r.sequence);
+
+              return (
+                <Marker key={i} position={[p.lat, p.lng]} icon={iconFactory(i + 1)}>
+                  <Popup>
+                    <div className="text-sm">
+                      <div className="font-semibold">
+                        #{i + 1} • Seq {p.sequence} • Stop {p.stop}
+                      </div>
+
+                      {sameLocation.length > 1 && (
+                        <div className="text-amber-600 font-medium">
+                          {sameLocation.length} entregas neste ponto — Seq: {sameSequences.join(", ")}
+                        </div>
+                      )}
+
+                      {p.spx && <div>SPX: {p.spx}</div>}
+                      <div>{p.address}</div>
+                      {p.cep && <div>CEP: {p.cep}</div>}
+
+                      {i > 0 && p.distanceFromPrev !== undefined && (
+                        <div className="text-xs text-gray-500">
+                          Distância do anterior: {(p.distanceFromPrev / 1000).toFixed(2)} km
+                        </div>
+                      )}
+                    </div>
+                  </Popup>
+                </Marker>
+              );
+            })}
 
             <Polyline positions={polyline} />
           </Map>
         )}
       </div>
 
-      {/* PAINEL */}
       <div className="p-4 overflow-y-auto space-y-4">
         <motion.h1 className="text-2xl font-bold">Roteirizador</motion.h1>
 
@@ -216,7 +263,7 @@ export default function LogisticsStopsApp(): ReactElement {
             <div
               key={i}
               className={`border p-3 rounded flex justify-between items-center ${
-                delivered.has(i) ? "bg-emerald-500" : ""
+                delivered.has(i) ? "bg-emerald-400" : ""
               }`}
             >
               <div className="text-sm">
@@ -225,8 +272,9 @@ export default function LogisticsStopsApp(): ReactElement {
                 </div>
 
                 {p.spx && <div>SPX: {p.spx}</div>}
-
                 <div>{p.address}</div>
+                {p.cep && <div>CEP: {p.cep}</div>}
+
 
                 {i > 0 && p.distanceFromPrev !== undefined && (
                   <div className="text-xs text-gray-500">
