@@ -20,53 +20,45 @@ type RawRow = {
   Latitude?: number | string;
   Longitude?: number | string;
   "Destination Address"?: string;
+  "SPX TN"?: string;
 };
 
-type StopGroup = {
+// Agora cada linha é um endereço individual (não agrupado)
+type AddressPoint = {
   stop: number;
-  sequences: number[];
+  sequence: number;
   lat: number;
   lng: number;
-  address: string[];
+  address: string;
+  spx?: string;
+  distanceFromPrev?: number; // metros
 };
 
-// ================= GROUP =================
+// ================= PARSE INDIVIDUAL =================
 
-function groupByStop(rows: RawRow[]): StopGroup[] {
-  const map: Record<number, StopGroup> = {};
-
-  rows.forEach((r) => {
-    if (!r.Stop || !r.Sequence) return;
-
-    const stop = Number(r.Stop);
-
-    if (!map[stop]) {
-      map[stop] = {
-        stop,
-        sequences: [],
-        lat: Number(r.Latitude),
-        lng: Number(r.Longitude),
-        address: [],
-      };
-    }
-
-    map[stop].sequences.push(Number(r.Sequence));
-    if (r["Destination Address"]) map[stop].address.push(String(r["Destination Address"]));
-  });
-
-  return Object.values(map);
+function parseRows(rows: RawRow[]): AddressPoint[] {
+  return rows
+    .filter((r) => r.Stop && r.Sequence && r.Latitude && r.Longitude)
+    .map((r) => ({
+      stop: Number(r.Stop),
+      sequence: Number(r.Sequence),
+      lat: Number(r.Latitude),
+      lng: Number(r.Longitude),
+      address: String(r["Destination Address"] ?? ""),
+      spx: r["SPX TN"] ? String(r["SPX TN"]) : undefined,
+    }));
 }
 
 // ================= OSRM =================
 
-async function fetchOptimizedTrip(stops: StopGroup[], startIndex: number) {
-  if (stops.length < 2) return { ordered: stops, geometry: [] };
+async function fetchOptimizedTrip(points: AddressPoint[], startIndex: number) {
+  if (points.length < 2) return { ordered: points, geometry: [] };
 
-  const reordered = [stops[startIndex], ...stops.filter((_, i) => i !== startIndex)];
+  const reordered = [points[startIndex], ...points.filter((_, i) => i !== startIndex)];
 
-  const coords = reordered.map((s) => `${s.lng},${s.lat}`).join(";");
+  const coords = reordered.map((p) => `${p.lng},${p.lat}`).join(";");
 
-  const url = `https://router.project-osrm.org/trip/v1/driving/${coords}?overview=full&geometries=geojson&roundtrip=false&source=first`;
+  const url = `https://router.project-osrm.org/trip/v1/driving/${coords}?overview=full&geometries=geojson&roundtrip=false&source=first&annotations=distance`;
 
   const res = await fetch(url);
   const data = await res.json();
@@ -77,42 +69,50 @@ async function fetchOptimizedTrip(stops: StopGroup[], startIndex: number) {
     trip?.geometry?.coordinates?.map((c: [number, number]) => [c[1], c[0]]) ?? [];
 
   // ordenar pela posição ao longo da geometria
-  const orderedStops = [...reordered].sort((a, b) => {
-    const indexA = geometry.findIndex(
+  const ordered = [...reordered].sort((a, b) => {
+    const idxA = geometry.findIndex(
       (g) => Math.abs((g as number[])[0] - a.lat) < 0.001 && Math.abs((g as number[])[1] - a.lng) < 0.001
     );
 
-    const indexB = geometry.findIndex(
+    const idxB = geometry.findIndex(
       (g) => Math.abs((g as number[])[0] - b.lat) < 0.001 && Math.abs((g as number[])[1] - b.lng) < 0.001
     );
 
-    return indexA - indexB;
+    return idxA - idxB;
   });
 
-  return { ordered: orderedStops, geometry };
+  // calcular distâncias entre pontos consecutivos
+  const legs = trip?.legs ?? [];
+
+  ordered.forEach((p, i) => {
+    if (i === 0) return;
+    p.distanceFromPrev = legs[i - 1]?.distance ?? 0;
+  });
+
+  return { ordered, geometry };
 }
 
 // ================= COMPONENT =================
 
 export default function LogisticsStopsApp(): ReactElement {
-  const [stops, setStops] = useState<StopGroup[]>([]);
-  const [routeStops, setRouteStops] = useState<StopGroup[]>([]);
+  const [points, setPoints] = useState<AddressPoint[]>([]);
+  const [route, setRoute] = useState<AddressPoint[]>([]);
   const [polyline, setPolyline] = useState<LatLngExpression[]>([]);
   const [startIndex, setStartIndex] = useState<number>(0);
   const [iconFactory, setIconFactory] = useState<any>(null);
   const [delivered, setDelivered] = useState<Set<number>>(new Set());
 
-  // carregar entregas da sessão
+  // persistência na sessão
   useEffect(() => {
-    const saved = sessionStorage.getItem("deliveredStops");
+    const saved = sessionStorage.getItem("deliveredPoints");
     if (saved) setDelivered(new Set(JSON.parse(saved)));
   }, []);
 
   useEffect(() => {
-    sessionStorage.setItem("deliveredStops", JSON.stringify(Array.from(delivered)));
+    sessionStorage.setItem("deliveredPoints", JSON.stringify(Array.from(delivered)));
   }, [delivered]);
 
-  // carregar ícone numerado
+  // ícones numerados
   useEffect(() => {
     import("leaflet").then((L) => {
       setIconFactory(() => (index: number) =>
@@ -135,9 +135,9 @@ export default function LogisticsStopsApp(): ReactElement {
       const sheet = wb.Sheets[wb.SheetNames[0]];
       const json = XLSX.utils.sheet_to_json<RawRow>(sheet);
 
-      const grouped = groupByStop(json);
-      setStops(grouped);
-      setRouteStops([]);
+      const parsed = parseRows(json);
+      setPoints(parsed);
+      setRoute([]);
       setDelivered(new Set());
     };
 
@@ -145,8 +145,8 @@ export default function LogisticsStopsApp(): ReactElement {
   }
 
   async function calculateRoute() {
-    const result = await fetchOptimizedTrip(stops, startIndex);
-    setRouteStops(result.ordered);
+    const result = await fetchOptimizedTrip(points, startIndex);
+    setRoute(result.ordered);
     setPolyline(result.geometry);
   }
 
@@ -156,20 +156,20 @@ export default function LogisticsStopsApp(): ReactElement {
     setDelivered(next);
   }
 
-  const nextStop = routeStops.findIndex((_, i) => !delivered.has(i));
+  const nextStop = route.findIndex((_, i) => !delivered.has(i));
 
   return (
     <div className="h-screen grid grid-cols-1 lg:grid-cols-[1fr_1fr]">
       {/* MAPA */}
       <div className="h-[260px] lg:h-screen">
         {polyline.length > 0 && iconFactory && (
-          <Map center={polyline[0]} zoom={12} className="h-full">
+          <Map center={polyline[0]} zoom={15} maxZoom={20} className="h-full">
             <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
 
-            {routeStops.map((s, i) => (
-              <Marker key={i} position={[s.lat, s.lng]} icon={iconFactory(i + 1)}>
+            {route.map((p, i) => (
+              <Marker key={i} position={[p.lat, p.lng]} icon={iconFactory(i + 1)}>
                 <Popup>
-                  #{i + 1} • Stop {s.stop}
+                  #{i + 1} • Seq {p.sequence} • Stop {p.stop}
                 </Popup>
               </Marker>
             ))}
@@ -185,12 +185,12 @@ export default function LogisticsStopsApp(): ReactElement {
 
         <input type="file" accept=".xlsx" onChange={handleUpload} />
 
-        {stops.length > 0 && (
+        {points.length > 0 && (
           <div className="flex gap-2 flex-wrap">
             <select value={startIndex} onChange={(e) => setStartIndex(Number(e.target.value))} className="border p-2">
-              {stops.map((s, i) => (
+              {points.map((p, i) => (
                 <option key={i} value={i}>
-                  Stop {s.stop}
+                  Seq {p.sequence} • Stop {p.stop}
                 </option>
               ))}
             </select>
@@ -199,37 +199,43 @@ export default function LogisticsStopsApp(): ReactElement {
               Calcular rota
             </button>
 
-            {nextStop >= 0 && routeStops[nextStop] && (
+            {nextStop >= 0 && route[nextStop] && (
               <a
-                href={`https://www.google.com/maps/dir/?api=1&destination=${routeStops[nextStop].lat},${routeStops[nextStop].lng}`}
+                href={`https://www.google.com/maps/dir/?api=1&destination=${route[nextStop].lat},${route[nextStop].lng}`}
                 target="_blank"
                 className="px-3 py-2 bg-emerald-600 text-white rounded"
               >
-                Navegar próximo stop
+                Navegar próximo endereço
               </a>
             )}
           </div>
         )}
 
         <div className="space-y-2">
-          {routeStops.map((s, i) => (
+          {route.map((p, i) => (
             <div
               key={i}
               className={`border p-3 rounded flex justify-between items-center ${
-                delivered.has(i) ? "bg-emerald-600" : ""
+                delivered.has(i) ? "bg-emerald-500" : ""
               }`}
             >
-              <div>
-                <strong>
-                  #{i + 1} • Stop {s.stop}
-                </strong>
-                <div className="text-sm">{s.address.join(" | ")}</div>
+              <div className="text-sm">
+                <div className="font-semibold">
+                  #{i + 1} • Seq {p.sequence} • Stop {p.stop}
+                </div>
+
+                {p.spx && <div>SPX: {p.spx}</div>}
+
+                <div>{p.address}</div>
+
+                {i > 0 && p.distanceFromPrev !== undefined && (
+                  <div className="text-xs text-gray-500">
+                    Distância do anterior: {(p.distanceFromPrev / 1000).toFixed(2)} km
+                  </div>
+                )}
               </div>
 
-              <button
-                onClick={() => toggleDelivered(i)}
-                className="px-2 py-1 text-sm border rounded"
-              >
+              <button onClick={() => toggleDelivered(i)} className="px-2 py-1 text-sm border rounded">
                 {delivered.has(i) ? "Desfazer" : "Entregue"}
               </button>
             </div>
